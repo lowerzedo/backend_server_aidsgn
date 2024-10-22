@@ -1,88 +1,59 @@
-from flask import Flask, request, jsonify, make_response
-from flask_cors import CORS
+from flask import Flask, request, jsonify
 import cv2
 import numpy as np
+import matplotlib
+matplotlib.use('Agg')  # Use a non-interactive backend
+import matplotlib.pyplot as plt
 from ultralytics import YOLO
+from io import BytesIO
 import base64
-import traceback
+import logging
+from flask_cors import CORS
 
 app = Flask(__name__)
+CORS(app, resources={r"/ai/*": {"origins": ["http://localhost:3000"]}})
 
-# Enable CORS for all routes and handle preflight OPTIONS requests
-CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Initialize the YOLO model once when the app starts
+try:
+    model = YOLO('./ai_models/model_09.pt')  # Replace with your trained model
+    logger.info("YOLO model loaded successfully.")
+except Exception as e:
+    logger.error(f"Error initializing YOLO model: {e}")
+    model = None
 
 # Define fixed sizes for furniture classes (width, height in meters)
 furniture_sizes = {
-    'bed': {'large': (1.5, 1.2), 'medium': (1.2, 1.0), 'small': (1.0, 0.8)},
-    'chair': {'large': (0.5, 0.5), 'medium': (0.4, 0.4), 'small': (0.3, 0.3)},
-    'cupboard': {'large': (1.2, 0.5), 'medium': (1.0, 0.4), 'small': (0.8, 0.3)},
-    'drawers': {'large': (1.0, 0.4), 'medium': (0.8, 0.3), 'small': (0.6, 0.3)},
-    'fireplace': {'medium': (1.2, 0.4)},
-    'ottoman': {'medium': (0.5, 0.5)},
-    'table': {'small': (0.6, 0.4)},
-    'sofa': {'large': (2.0, 0.8), 'medium': (1.6, 0.7), 'small': (1.2, 0.6)},
-    'windows': {'medium': (1.0, 0.1)},  # Adjusted size
-    'door': {'medium': (0.8, 0.1)},     # Adjusted size
+    'Bed': (1.5, 2.0),
+    'Chair': (0.5, 0.5),
+    'Door': (1.0, 0.1),
+    'Sofa': (1.2, 0.6),
+    'Table': (0.5, 0.3),
+    'Window': (1.0, 0.1),
     # Add more classes as needed
 }
 
 # List of classes to ignore (decorative or structural elements)
-ignored_classes = [
-    'floor', 'walls', 'wallHanging', 'rug', 'curtains',
-    'lamp', 'light', 'plant', 'mirror'  # Classes to ignore
-]
+ignored_classes = []  # Empty since all classes are relevant
 
-# Mapping model class names to our classes (if necessary)
-class_name_mapping = {
-    'sofa': 'sofa',
-    'couch': 'sofa',
-    'chair': 'chair',
-    'bed': 'bed',
-    'table': 'table',
-    'diningtable': 'table',
-    'tvmonitor': 'tv',
-    'door': 'door',
-    'window': 'windows',
-    'fireplace': 'fireplace',
-    # Add more mappings based on your model's classes
+# Mapping of image indices to wall names and orientations
+wall_mapping = {
+    0: {'name': 'Left', 'orientation': 'Vertical'},
+    1: {'name': 'Top', 'orientation': 'Horizontal'},
+    2: {'name': 'Right', 'orientation': 'Vertical'},
+    3: {'name': 'Bottom', 'orientation': 'Horizontal'}
 }
 
-# Initialize the YOLO model (make sure 'model_5.pt' is accessible)
-model = YOLO('ai_models/model_5.pt')  # Replace with your trained model or 'yolov5s.pt'
-
-@app.route('/ai/process_image', methods=['POST', 'OPTIONS'])
-def process_image():
-    if request.method == 'OPTIONS':
-        # Handle preflight CORS request
-        response = make_response()
-        response.headers.add("Access-Control-Allow-Origin", "*")
-        response.headers.add("Access-Control-Allow-Headers", "Content-Type")
-        response.headers.add("Access-Control-Allow-Methods", "POST, OPTIONS")
-        return response
-
+def perform_object_detection(model, image, class_name_mapping, image_idx):
+    """Perform object detection on a single image and return detected objects."""
     try:
-        # Check if 'image' is in request.files
-        if 'image' not in request.files:
-            return jsonify({'error': 'No image file in request'}), 400
-
-        image_file = request.files['image']
-        if image_file.filename == '':
-            return jsonify({'error': 'No selected file'}), 400
-
-        # Read the image into cv2
-        file_bytes = np.frombuffer(image_file.read(), np.uint8)
-        image = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
-
-        if image is None:
-            return jsonify({'error': 'Unable to read image file'}), 400
-
-        # Resize the image to 640x640 pixels if it's not already
-        image = cv2.resize(image, (640, 640))
-
-        # Perform object detection
+        """Perform object detection on a single image and return detected objects."""
+        print(f"Performing object detection on Image {image_idx + 1}...")
         results = model(image)
-
-        # Extract detection results
         detected_objects = []
         for result in results:
             boxes = result.boxes
@@ -100,359 +71,459 @@ def process_image():
                     'bbox': bbox,
                     'confidence': conf
                 })
-
-        # If no objects detected, return error
-        if not detected_objects:
-            return jsonify({'error': 'No relevant objects detected.'}), 400
-
-        # Identify the largest object among furniture as the reference object
-        furniture_objects = [obj for obj in detected_objects if obj['class'] not in ['door', 'windows'] + ignored_classes]
-        if not furniture_objects:
-            return jsonify({'error': 'No furniture objects detected.'}), 400
-
-        largest_object = max(
-            furniture_objects,
-            key=lambda obj: (obj['bbox'][2] - obj['bbox'][0]) * (obj['bbox'][3] - obj['bbox'][1])
-        )
-
-        # Assign fixed size to the largest object
-        reference_class = largest_object['class']
-        reference_bbox = largest_object['bbox']
-        reference_area = (reference_bbox[2] - reference_bbox[0]) * (reference_bbox[3] - reference_bbox[1])
-
-        # Assume the largest size category for the reference object
-        reference_size_category = 'large'
-        reference_size = furniture_sizes.get(reference_class, {'medium': (1.0, 1.0)}).get(reference_size_category, (1.0, 1.0))
-
-        # Calculate scaling factor (meters per pixel)
-        reference_pixel_width = reference_bbox[2] - reference_bbox[0]
-        reference_real_width = reference_size[0]  # Width in meters
-        scaling_factor = reference_real_width / reference_pixel_width  # meters per pixel
-
-        # Map object positions and sizes to the layout
-        layout_objects = []
+        print(f"Detected {len(detected_objects)} relevant objects in Image {image_idx + 1}.")
         for obj in detected_objects:
-            obj_class = obj['class']
             bbox = obj['bbox']
-            pixel_width = bbox[2] - bbox[0]
-            pixel_height = bbox[3] - bbox[1]
-            pixel_area = pixel_width * pixel_height
+            print(f" - Class: {obj['class']}, Confidence: {obj['confidence']:.2f}, BBox: {bbox}")
+        print()
+        return detected_objects
+    except Exception as e:
+        logger.error(f"Error in perform_object_detection: {e}")
+        raise
 
-            # For doors and windows, assign fixed size category
-            if obj_class in ['door', 'windows']:
-                size_category = 'medium'
+def get_reference_object(detected_objects, image, image_idx):
+    """Identify the furniture object closest to the image center."""
+    try:
+        """Identify the furniture object closest to the image center."""
+        print(f"Selecting reference object from Image {image_idx + 1}...")
+        if not detected_objects:
+            raise ValueError("No furniture objects detected.")
+
+        image_height, image_width = image.shape[:2]
+        center_x, center_y = image_width / 2, image_height / 2
+        print(f"Image {image_idx + 1} Dimensions: Width = {image_width}px, Height = {image_height}px")
+        print(f"Image Center: ({center_x}px, {center_y}px)")
+
+        # Calculate distance of each object to the center of the image
+        for obj in detected_objects:
+            bbox = obj['bbox']
+            obj_center_x = (bbox[0] + bbox[2]) / 2
+            obj_center_y = (bbox[1] + bbox[3]) / 2
+            distance = np.sqrt((obj_center_x - center_x) ** 2 + (obj_center_y - center_y) ** 2)
+            obj['distance_to_center'] = distance
+            print(f" - Class: {obj['class']}, Distance to Center: {distance:.2f}px")
+
+        # Select the object with the minimum distance to the center
+        reference_object = min(detected_objects, key=lambda obj: obj['distance_to_center'])
+        print(f"Selected Reference Object: {reference_object['class']}, BBox: {reference_object['bbox']}, Distance to Center: {reference_object['distance_to_center']:.2f}px\n")
+        return reference_object
+    except Exception as e:
+        logger.error(f"Error in get_reference_object: {e}")
+        raise
+
+def calculate_scaling_factor(reference_bbox, reference_class, image_height_px, image_idx, distance_constant=0.026):
+    """Calculate the scaling factor based on the reference object's bounding box height."""
+    try:
+        print(f"Calculating scaling factor for Image {image_idx + 1}...")
+        reference_pixel_height = reference_bbox[3] - reference_bbox[1]
+        print(f"Reference Object Pixel Height: {reference_pixel_height} pixels")
+
+        # Compute scaling factor
+        # These constants should be based on your camera's specifications
+        # Adjust these values as per your actual camera parameters
+        sensor_height_mm = 24  # Example value; replace with actual sensor height
+        print(f"Sensor Height: {sensor_height_mm} mm")
+        print(f"Image Height: {image_height_px} pixels")
+        h = (reference_pixel_height * (sensor_height_mm / image_height_px)) / 1000  # Convert to meters
+        print(f"Computed 'h' (meters): {h:.6f}")
+
+        # Calculate the real distance between camera and object
+        # Adjust the constant based on your setup (e.g., camera height, lens properties)
+        real_distance_between_camera_and_object = distance_constant / h
+        print(f"Real Distance Between Camera and Object: {real_distance_between_camera_and_object:.6f} meters\n")
+
+        return real_distance_between_camera_and_object
+    except Exception as e:
+        logger.error(f"Error in calculate_scaling_factor: {e}")
+        raise
+
+def calculate_room_dimension(idx, image, model, class_name_mapping):
+    """Calculate either room width or height based on the image index."""
+    try:
+        detected_objects = perform_object_detection(model, image, class_name_mapping, idx)
+
+        if not detected_objects:
+            raise ValueError("No furniture objects detected.")
+
+        reference_object = get_reference_object(detected_objects, image, idx)
+
+        reference_class = reference_object['class']
+        reference_bbox = reference_object['bbox']
+
+        # Get image height in pixels
+        image_height_px = image.shape[0]
+        print(f"Image {idx + 1} Height: {image_height_px} pixels")
+
+        # Calculate scaling factor
+        scaling_factor = calculate_scaling_factor(reference_bbox, reference_class, image_height_px, idx)
+
+        # Retrieve the fixed size of the reference object from furniture_sizes
+        if reference_class in furniture_sizes:
+            furniture_width, furniture_height = furniture_sizes[reference_class]
+            print(f"Reference Class '{reference_class}' Fixed Size: Width = {furniture_width} m, Height = {furniture_height} m")
+        else:
+            print(f"Reference class '{reference_class}' not found in furniture_sizes.")
+            sys.exit()
+
+        # Calculate room dimension by adding real distance to the furniture size
+        if idx == 0:
+            # First image for room height (Left Wall)
+            room_dimension = (furniture_height + scaling_factor)
+            dimension_type = 'Height'
+        elif idx == 1:
+            # Second image for room width (Top Wall)
+            room_dimension = (furniture_height + scaling_factor)
+            dimension_type = 'Width'
+        else:
+            room_dimension = None
+            dimension_type = None
+
+        if room_dimension is not None:
+            print(f"Calculated {dimension_type}: {room_dimension:.2f} meters (Total)\n")
+        return room_dimension, reference_bbox, dimension_type
+    except Exception as e:
+        logger.error(f"Error in calculate_room_dimension: {e}")
+        raise
+
+def adjust_object_positions(objects, wall_length):
+    """Adjust positions of objects to avoid overlaps along a wall."""
+    try:
+        if not objects:
+            return objects
+
+        # Sort objects by their position along the wall
+        objects.sort(key=lambda obj: obj['position'])
+
+        for i in range(1, len(objects)):
+            prev_obj = objects[i - 1]
+            curr_obj = objects[i]
+
+            # Calculate the end position of the previous object
+            prev_end = prev_obj['position'] + prev_obj['size_along_wall'] / 2
+            # Calculate the start position of the current object
+            curr_start = curr_obj['position'] - curr_obj['size_along_wall'] / 2
+
+            # If they overlap, adjust the current object's position
+            overlap = prev_end - curr_start
+            if overlap > 0:
+                # Shift the current object forward to eliminate overlap
+                shift = overlap + 0.01  # Adding small padding
+                curr_obj['position'] += shift
+                # Ensure the current object's position is within bounds
+                curr_obj['position'] = min(wall_length - curr_obj['size_along_wall'] / 2, curr_obj['position'])
+        return objects
+    except Exception as e:
+        logger.error(f"Error in adjust_object_positions: {e}")
+        raise
+
+def draw_room(room_width, room_height, walls_objects):
+    """Draw a simple 2D representation of the room with objects on walls and return the image buffer."""
+    try:
+        fig, ax = plt.subplots(figsize=(10, 8))
+
+        # Draw the room as a rectangle
+        room = plt.Rectangle((0, 0), room_width, room_height, fill=None, edgecolor='black', linewidth=2)
+        ax.add_patch(room)
+
+        # Define wall positions
+        walls = {
+            'Top': {'start': (0, room_height), 'end': (room_width, room_height), 'orientation': 'Horizontal'},
+            'Right': {'start': (room_width, 0), 'end': (room_width, room_height), 'orientation': 'Vertical'},
+            'Bottom': {'start': (0, 0), 'end': (room_width, 0), 'orientation': 'Horizontal'},
+            'Left': {'start': (0, 0), 'end': (0, room_height), 'orientation': 'Vertical'}
+        }
+
+        # Draw and annotate walls with objects
+        for wall_name, wall_info in walls.items():
+            if wall_name not in walls_objects:
+                continue  # Skip walls without images
+
+            orientation = wall_info['orientation']
+            print(f"Drawing {wall_name} Wall ({orientation})...")
+            # Draw wall line
+            wall_line = plt.Line2D(
+                [wall_info['start'][0], wall_info['end'][0]],
+                [wall_info['start'][1], wall_info['end'][1]],
+                color='black',
+                linewidth=2
+            )
+            ax.add_line(wall_line)
+
+            wall_objects = walls_objects[wall_name]['objects']
+            wall_length = room_width if orientation == 'Horizontal' else room_height
+
+            # Prepare objects: swap dimensions if necessary, set size_along_wall
+            for obj in wall_objects:
+                obj_class = obj['class']
+                obj_width = obj['real_width']
+                obj_height = obj['real_height']
+
+                if orientation == 'Vertical':
+                    swapped_width = obj_height
+                    swapped_height = obj_width
+                else:
+                    swapped_width = obj_width
+                    swapped_height = obj_height
+
+                obj['swapped_width'] = swapped_width
+                obj['swapped_height'] = swapped_height
+                obj['size_along_wall'] = swapped_width  # Size along the wall
+
+            # Adjust object positions
+            # Separate furniture from windows
+            furniture = [obj for obj in wall_objects if obj['class'] != 'Window']
+            windows = [obj for obj in wall_objects if obj['class'] == 'Window']
+            furniture = adjust_object_positions(furniture, wall_length)
+
+            for obj in windows:
+                print(f" - Detected {len(windows)} window(s) on {wall_name} Wall.")
+                for idx, window in enumerate(windows):
+                    window_width = window['real_width']
+                    window_height = window['real_height']
+
+                    if orientation == 'Horizontal':
+                        # Distribute windows evenly along the wall
+                        spacing = room_width / (len(windows) + 0.2)
+                        window_x = spacing * (idx + 1) - window_width / 2
+                        window_y = wall_info['start'][1]  # Align with wall y-position
+                        window_y = window_y - 0.05
+
+                        # Draw window as a rectangle
+                        window_rect = plt.Rectangle((window_x, window_y), window_width, window_height,  facecolor='white', edgecolor='black', alpha=0.7)
+                        ax.add_patch(window_rect)
+
+                        # Annotate the window
+                        plt.text(window_x + window_width / 2, window_y + window_height / 2, 'Window',
+                                ha='center', va='center', fontsize=8, color='black')
+                    else:  # Vertical
+                        # Distribute windows evenly along the wall
+                        spacing = room_height / (len(windows) + 0.5)
+                        window_y = spacing * (idx + 1) - window_height / 2
+                        window_x = wall_info['start'][0]  # Align with wall x-position
+
+                        window_x = window_x - 0.05
+
+                        # Draw window as a rectangle
+                        window_rect = plt.Rectangle((window_x, window_y), window_height, window_width,  facecolor='white', edgecolor='black', alpha=0.7)
+                        ax.add_patch(window_rect)
+
+                        # Annotate the window
+                        plt.text(window_x + window_height / 2, window_y + window_width / 2, 'Window',
+                                ha='center', va='center', fontsize=8, color='black')
+                print(f" - Placed {len(windows)} window(s) on {wall_name} Wall.\n")
             else:
-                # Calculate the area ratio compared to the reference object
-                area_ratio = pixel_area / reference_area
+                print(f" - No windows detected on {wall_name} Wall.\n")
 
-                # Assign size category based on area ratio
-                if area_ratio > 0.7:
-                    size_category = 'large'
-                elif area_ratio > 0.4:
-                    size_category = 'medium'
-                else:
-                    size_category = 'small'
+            # Update positions in wall_objects for adjusted furniture
+            for obj in wall_objects:
+                if obj['class'] != 'Window':
+                    # Find the adjusted position from furniture
+                    adjusted_obj = next((f_obj for f_obj in furniture if f_obj is obj), None)
+                    if adjusted_obj:
+                        obj['position'] = adjusted_obj['position']
 
-            # Get real-world size (width, height in meters)
-            real_size = furniture_sizes.get(obj_class, {'medium': (1.0, 1.0)}).get(size_category, (1.0, 1.0))
-
-            # Calculate the center position in pixels
-            center_x = (bbox[0] + bbox[2]) / 2
-            center_y = (bbox[1] + bbox[3]) / 2
-
-            # Convert center position to meters using the scaling factor
-            real_x = center_x * scaling_factor
-            real_y = center_y * scaling_factor
-
-            layout_objects.append({
-                'class': obj_class,
-                'size': real_size,
-                'position': (real_x, real_y),
-                'bbox': bbox,
-                'size_category': size_category,
-                'original_center': (center_x, center_y)  # Store original center position
-            })
-
-        # Function to estimate room size based on object positions and sizes
-        def estimate_room_size(layout_objects, margin=0.5):
-            # Exclude ignored classes from room size estimation
-            relevant_objects = [obj for obj in layout_objects if obj['class'] not in ignored_classes]
-            # Find the minimum and maximum extents of the objects
-            min_x = min(obj['position'][0] - obj['size'][0] / 2 for obj in relevant_objects)
-            max_x = max(obj['position'][0] + obj['size'][0] / 2 for obj in relevant_objects)
-            min_y = min(obj['position'][1] - obj['size'][1] / 2 for obj in relevant_objects)
-            max_y = max(obj['position'][1] + obj['size'][1] / 2 for obj in relevant_objects)
-
-            # Calculate room dimensions with margin
-            room_width = max_x - min_x + margin
-            room_height = max_y - min_y + margin
-
-            return room_width, room_height, min_x - margin / 2, min_y - margin / 2
-
-        # Estimate room size
-        room_width, room_height, offset_x, offset_y = estimate_room_size(layout_objects, margin=0.5)
-
-        # Ensure minimum room size (e.g., 3m x 3m)
-        room_width = max(3.0, room_width)
-        room_height = max(3.0, room_height)
-
-        room_size_meters = (room_width, room_height)
-        canvas_size_pixels = (600, int(600 * (room_height / room_width)))  # Adjust canvas height based on aspect ratio
-
-        # Define grid parameters
-        cell_size = 0.5  # Grid cell size in meters for finer placement
-        grid_cols = int(np.ceil(room_width / cell_size))
-        grid_rows = int(np.ceil(room_height / cell_size))
-
-        # Initialize grid with None
-        grid = [[None for _ in range(grid_cols)] for _ in range(grid_rows)]
-
-        # Create a blank image for the layout
-        layout_image = np.ones((canvas_size_pixels[1], canvas_size_pixels[0], 3), dtype=np.uint8) * 255  # White background
-
-        # Scaling factors for the layout canvas
-        layout_scaling_factor_x = canvas_size_pixels[0] / room_width
-        layout_scaling_factor_y = canvas_size_pixels[1] / room_height
-
-        # Draw walls (edges of the room)
-        cv2.rectangle(layout_image, (0, 0), (canvas_size_pixels[0]-1, canvas_size_pixels[1]-1), (0, 0, 0), 2)  # Black walls
-
-        # Function to map real-world coordinates to grid indices
-        def map_to_grid(x, y):
-            grid_x = int(x // cell_size)
-            grid_y = int(y // cell_size)
-            return grid_x, grid_y
-
-        # Function to check if the required grid cells are free
-        def is_grid_free(grid, start_x, start_y, cells_needed_x, cells_needed_y):
-            for i in range(start_y, start_y + cells_needed_y):
-                for j in range(start_x, start_x + cells_needed_x):
-                    if i >= grid_rows or j >= grid_cols:
-                        return False
-                    if grid[i][j] is not None:
-                        return False
-            return True
-
-        # Function to mark grid cells as occupied
-        def mark_grid(grid, obj, start_x, start_y, cells_needed_x, cells_needed_y):
-            for i in range(start_y, start_y + cells_needed_y):
-                for j in range(start_x, start_x + cells_needed_x):
-                    grid[i][j] = obj
-
-        # Collect windows and doors for special handling
-        windows = [obj for obj in layout_objects if obj['class'] == 'windows']
-        doors = [obj for obj in layout_objects if obj['class'] == 'door']
-        furniture = [obj for obj in layout_objects if obj['class'] not in ['windows', 'door'] + ignored_classes]
-
-        # Function to place windows based on their image position
-        def place_windows(windows, grid, room_width, room_height, cell_size):
-            image_width = 640  # Your image width
-            for window in windows:
-                # Get the original center x-coordinate in pixels
-                center_x = window['original_center'][0]
-                # Determine if the window is closer to the left or right side of the image
-                if center_x < image_width * 0.33:
-                    closest_wall = 'left'
-                elif center_x > image_width * 0.66:
-                    closest_wall = 'right'
-                else:
-                    closest_wall = 'left'  # Default to left if in the middle third
-
-                # Swap dimensions if on left or right wall
-                real_width, real_height = window['size']
-                if closest_wall in ['left', 'right']:
-                    real_width, real_height = real_height, real_width  # Swap dimensions
-
-                # Adjust position to be on the wall line
-                if closest_wall == 'left':
-                    adjusted_x = 0  # On the left wall line
-                    adjusted_y = window['position'][1] - offset_y  # Keep original y
-                elif closest_wall == 'right':
-                    adjusted_x = room_width  # On the right wall line
-                    adjusted_y = window['position'][1] - offset_y  # Keep original y
-                else:
-                    adjusted_x = 0
-                    adjusted_y = room_height / 2  # Center vertically
-
-                # Update window's adjusted position and size
-                window['adjusted_position'] = (adjusted_x, adjusted_y)
-                window['size'] = (real_width, real_height)
-
-                # Map to grid
-                grid_x, grid_y = map_to_grid(adjusted_x, adjusted_y)
-                cells_needed_x = max(1, int(np.ceil(real_width / cell_size)))
-                cells_needed_y = max(1, int(np.ceil(real_height / cell_size)))
-
-                if is_grid_free(grid, grid_x, grid_y, cells_needed_x, cells_needed_y):
-                    mark_grid(grid, window, grid_x, grid_y, cells_needed_x, cells_needed_y)
-                else:
-                    print(f"Warning: Could not place window '{window['class']}' due to overlap.")
-
-        # Function to place doors based on their positions
-        def place_doors(doors, grid, room_width, room_height, cell_size):
-            for door in doors:
-                obj_class = door['class']
-                real_width, real_height = door['size']
-                real_x, real_y = door['position']
-
-                # Determine the closest wall
-                distances_to_walls = {
-                    'left': real_x - offset_x,
-                    'right': room_width - (real_x - offset_x),
-                    'top': real_y - offset_y,
-                    'bottom': room_height - (real_y - offset_y)
-                }
-                closest_wall = min(distances_to_walls, key=distances_to_walls.get)
-
-                # Adjust position to be on the wall line
-                if closest_wall == 'left':
-                    adjusted_x = 0
-                    adjusted_y = real_y - offset_y
-                elif closest_wall == 'right':
-                    adjusted_x = room_width
-                    adjusted_y = real_y - offset_y
-                elif closest_wall == 'top':
-                    adjusted_x = real_x - offset_x
-                    adjusted_y = 0
-                elif closest_wall == 'bottom':
-                    adjusted_x = real_x - offset_x
-                    adjusted_y = room_height
-
-                # Update door's adjusted position and size
-                door['adjusted_position'] = (adjusted_x, adjusted_y)
-                door['size'] = (real_width, real_height)
-
-                # Map to grid
-                grid_x, grid_y = map_to_grid(adjusted_x, adjusted_y)
-                cells_needed_x = max(1, int(np.ceil(real_width / cell_size)))
-                cells_needed_y = max(1, int(np.ceil(real_height / cell_size)))
-
-                if is_grid_free(grid, grid_x, grid_y, cells_needed_x, cells_needed_y):
-                    mark_grid(grid, door, grid_x, grid_y, cells_needed_x, cells_needed_y)
-                else:
-                    print(f"Warning: Could not place door '{door['class']}' due to overlap.")
-
-        # Function to place furniture based on their positions
-        def place_furniture(furniture, grid, room_width, room_height, cell_size):
+            # Now proceed to draw the objects
             for obj in furniture:
                 obj_class = obj['class']
-                real_width, real_height = obj['size']
-                real_x, real_y = obj['position']
+                swapped_width = obj['swapped_width']
+                swapped_height = obj['swapped_height']
+                obj_position = obj['position']
 
-                # Adjust positions based on room offset
-                adjusted_x = real_x - offset_x
-                adjusted_y = real_y - offset_y
-
-                # Map to grid
-                grid_x, grid_y = map_to_grid(adjusted_x, adjusted_y)
-                cells_needed_x = max(1, int(np.ceil(real_width / cell_size)))
-                cells_needed_y = max(1, int(np.ceil(real_height / cell_size)))
-
-                # Check if object is near the center to adjust placement
-                center_threshold_x = room_width * 0.3 <= adjusted_x <= room_width * 0.7
-                center_threshold_y = room_height * 0.3 <= adjusted_y <= room_height * 0.7
-
-                if center_threshold_x and center_threshold_y:
-                    # Place near the top wall by adjusting the y-coordinate
-                    adjusted_y = real_height / 2  # Slightly away from the wall
-
-                    # Re-map to grid after adjustment
-                    grid_x, grid_y = map_to_grid(adjusted_x, adjusted_y)
-
-                # Check if placement is within grid bounds
-                if grid_x + cells_needed_x > grid_cols or grid_y + cells_needed_y > grid_rows:
-                    print(f"Warning: {obj_class} at position ({adjusted_x}, {adjusted_y}) exceeds room boundaries.")
-                    continue
-
-                if is_grid_free(grid, grid_x, grid_y, cells_needed_x, cells_needed_y):
-                    mark_grid(grid, obj, grid_x, grid_y, cells_needed_x, cells_needed_y)
-                    obj['adjusted_position'] = (adjusted_x, adjusted_y)
+                if orientation == 'Vertical':
+                    x_position = wall_info['start'][0]
+                    if wall_name == 'Left':
+                        obj_x = x_position + 0.05
+                    else:
+                        obj_x = x_position - 0.05 - swapped_width
+                    obj_y = obj_position - swapped_height / 2
+                    rect_width = swapped_width
+                    rect_height = swapped_height
                 else:
-                    # Attempt to find nearby free cells while maintaining relative positions
-                    placed = False
-                    search_radius = 1
-                    while not placed and search_radius < max(grid_rows, grid_cols):
-                        for dy in range(-search_radius, search_radius + 1):
-                            for dx in range(-search_radius, search_radius + 1):
-                                new_grid_x = grid_x + dx
-                                new_grid_y = grid_y + dy
+                    obj_x = obj_position - swapped_width / 2
+                    y_position = wall_info['start'][1]
+                    if wall_name == 'Top':
+                        obj_y = y_position - 0.05 - swapped_height
+                    else:
+                        obj_y = y_position + 0.05
+                    rect_width = swapped_width
+                    rect_height = swapped_height
 
-                                if (0 <= new_grid_x < grid_cols - cells_needed_x + 1 and
-                                    0 <= new_grid_y < grid_rows - cells_needed_y + 1):
-                                    if is_grid_free(grid, new_grid_x, new_grid_y, cells_needed_x, cells_needed_y):
-                                        mark_grid(grid, obj, new_grid_x, new_grid_y, cells_needed_x, cells_needed_y)
-                                        # Update adjusted position based on new grid placement
-                                        new_real_x = (new_grid_x + cells_needed_x / 2) * cell_size
-                                        new_real_y = (new_grid_y + cells_needed_y / 2) * cell_size
-                                        obj['adjusted_position'] = (new_real_x, new_real_y)
-                                        placed = True
-                                        break
-                        if placed:
-                            break
-                        search_radius += 1
-                    if not placed:
-                        print(f"Warning: Could not place {obj_class} at ({adjusted_x}, {adjusted_y}) due to overlap.")
+                # Draw the object as a rectangle
+                obj_rect = plt.Rectangle((obj_x, obj_y), rect_width, rect_height,
+                                        facecolor='white', edgecolor='black', alpha=0.7)
+                ax.add_patch(obj_rect)
 
-        # Place windows, doors, and furniture
-        place_windows(windows, grid, room_width, room_height, cell_size)
-        place_doors(doors, grid, room_width, room_height, cell_size)
-        place_furniture(furniture, grid, room_width, room_height, cell_size)
+                # Annotate the object
+                plt.text(obj_x + rect_width / 2, obj_y + rect_height / 2, obj_class,
+                        ha='center', va='center', fontsize=8, color='black')
 
-        # Draw each object on the layout
-        for obj in layout_objects:
-            # Skip objects without 'adjusted_position' (unplaced objects)
-            if 'adjusted_position' not in obj:
-                continue  # Skip unplaced objects
-
-            obj_class = obj['class']
-            real_width, real_height = obj['size']
-            adjusted_x, adjusted_y = obj['adjusted_position']
-
-            # Convert real-world coordinates to canvas pixels
-            canvas_x = int(adjusted_x * layout_scaling_factor_x)
-            canvas_y = int(adjusted_y * layout_scaling_factor_y)
-            canvas_width = int(real_width * layout_scaling_factor_x)
-            canvas_height = int(real_height * layout_scaling_factor_y)
-
-            # Calculate top-left and bottom-right coordinates
-            top_left = (int(canvas_x - canvas_width / 2), int(canvas_y - canvas_height / 2))
-            bottom_right = (int(canvas_x + canvas_width / 2), int(canvas_y + canvas_height / 2))
-
-            # Ensure coordinates are within the canvas
-            top_left = (max(0, top_left[0]), max(0, top_left[1]))
-            bottom_right = (min(canvas_size_pixels[0]-1, bottom_right[0]), min(canvas_size_pixels[1]-1, bottom_right[1]))
-
-            # Draw the object
-            cv2.rectangle(layout_image, top_left, bottom_right, (255, 255, 255), -1)  # White fill
-            cv2.rectangle(layout_image, top_left, bottom_right, (0, 0, 0), 1)  # Black outline
-
-            # Place label at the center
-            label_x = (top_left[0] + bottom_right[0]) // 2 - 10  # Adjust for text width
-            label_y = (top_left[1] + bottom_right[1]) // 2 + 5
-            cv2.putText(layout_image, obj_class, (label_x, label_y),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 1, cv2.LINE_AA)
-
-        # Encode the image to base64
-        is_success, buffer = cv2.imencode('.png', layout_image)
-        if not is_success:
-            response = jsonify({'error': 'Failed to encode image'})
-            response.headers.add("Access-Control-Allow-Origin", "*")
-            return response, 500
-
-        encoded_image = base64.b64encode(buffer).decode('utf-8')
-
-        # Return response with CORS headers
-        response = jsonify({'layout_image': encoded_image})
-        response.headers.add("Access-Control-Allow-Origin", "*")
-        return response
+            print(f" - Placed {len(wall_objects)} object(s) on {wall_name} Wall.\n")
 
     except Exception as e:
-        # Log the exception traceback
-        traceback.print_exc()
-        # Return error response with CORS headers
-        response = jsonify({'error': 'An error occurred during processing.'})
-        response.headers.add("Access-Control-Allow-Origin", "*")
-        return response, 500
+        logger.error(f"Error in draw_room: {e}")
+        raise  # Re-raise the exception after logging
+
+        # Set plot limits and aesthetics
+    padding = max(room_width, room_height) * 0.1  # 10% padding
+    ax.set_xlim(-padding, room_width + padding)
+    ax.set_ylim(-padding, room_height + padding)
+    ax.set_aspect('equal')
+    ax.axis('off')  # Hide axes for better visualization
+
+        # Save the figure to a buffer
+    try:
+        image_buffer = BytesIO()
+        plt.savefig(image_buffer, format='png', bbox_inches='tight')
+        plt.close(fig)
+        image_buffer.seek(0)
+
+            # Encode the image to Base64
+        image_base64 = base64.b64encode(image_buffer.getvalue()).decode('utf-8')
+
+        return image_base64
+    except Exception as e:
+        logger.error(f"Error encoding layout image: {e}")
+        raise  # Re-raise the exception after logging
+
+
+@app.route('/ai/process_image', methods=['POST'])
+def process_image():
+    if not model:
+        logger.error("Model not initialized.")
+        return jsonify({'error': 'Model not initialized'}), 500
+
+    images = []
+    if 'image' not in request.files:
+        logger.error("No image part in the request.")
+        return jsonify({'error': 'No image part in the request'}), 400
+
+    files = request.files.getlist('image')
+    if not files or len(files) == 0:
+        logger.error("No image uploaded.")
+        return jsonify({'error': 'No image uploaded'}), 400
+
+    if len(files) > 4:
+        logger.error("Too many images uploaded.")
+        return jsonify({'error': 'You can upload up to 4 images'}), 400
+
+    logger.info(f"Number of images received: {len(files)}")
+
+    # Read the images into OpenCV format
+    for file in files:
+        try:
+            in_memory_file = BytesIO()
+            file.save(in_memory_file)
+            in_memory_file.seek(0)
+            file_bytes = np.asarray(bytearray(in_memory_file.read()), dtype=np.uint8)
+            image = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+            if image is None:
+                logger.error("Invalid image uploaded.")
+                return jsonify({'error': 'Invalid image'}), 400
+            images.append(image)
+        except Exception as e:
+            logger.error(f"Error processing uploaded image: {e}")
+            return jsonify({'error': 'Error processing uploaded image'}), 400
+
+    try:
+        # Define class name mapping (optional)
+        class_name_mapping = {
+            'Bed': 'Bed',
+            'Chair': 'Chair',
+            'Door': 'Door',
+            'Sofa': 'Sofa',
+            'Table': 'Table',
+            'Window': 'Window',
+            # Add more mappings if needed
+        }
+
+        # Define wall mapping based on image index
+        wall_mapping_indices = {
+            0: 'Left',
+            1: 'Top',
+            2: 'Right',
+            3: 'Bottom'
+        }
+
+        # Calculate room dimensions from the first two images
+        room_dimensions = {}
+        walls_present = []
+
+        for idx in range(2):  # Use only first two images for size
+            if idx >= len(images):
+                break
+            wall = wall_mapping_indices.get(idx, f'Wall_{idx+1}')
+            dimension, bbox, dim_type = calculate_room_dimension(idx, images[idx], model, class_name_mapping)
+            logger.info("Dimension calculated.")
+
+            if dim_type:
+                room_dimensions[dim_type] = dimension
+                walls_present.append(wall)
+                logger.info(f"Added {dim_type} for {wall} Wall.")
+
+        room_width = room_dimensions.get('Width', None)
+        room_height = room_dimensions.get('Height', None)
+        logger.info(f"Room Dimensions - Width: {room_width}, Height: {room_height}")
+
+        if room_width is None or room_height is None:
+            logger.error("Unable to calculate room dimensions.")
+            return jsonify({'error': 'Unable to calculate room dimensions'}), 500
+        logger.info("Room dimensions successfully calculated.")
+        
+        # Prepare to collect objects for each wall
+        walls_objects = {}
+
+        # Process all images and collect objects for corresponding walls
+        for idx, image in enumerate(images):
+            if idx >= 4:
+                break
+            wall_info = wall_mapping.get(idx)
+            if not wall_info:
+                logger.warning(f"No wall mapping found for image index {idx}. Skipping.")
+                continue
+            wall_name = wall_info['name']
+            orientation = wall_info['orientation']
+
+            detected_objects = perform_object_detection(model, image, class_name_mapping, idx)
+            if not detected_objects:
+                logger.warning(f"No objects detected in Image {idx + 1}. Skipping.")
+                continue
+
+            image_height_px, image_width_px = image.shape[:2]
+            if orientation == 'Horizontal':
+                meters_per_pixel = room_width / image_width_px
+            else:
+                meters_per_pixel = room_height / image_width_px
+
+            objects_real_sizes = []
+            for obj in detected_objects:
+                obj_class = obj['class']
+                obj_width, obj_height = furniture_sizes.get(obj_class, (0.5, 0.5))
+                bbox = obj['bbox']
+                obj_center_x = (bbox[0] + bbox[2]) / 2
+
+                obj_position = obj_center_x * meters_per_pixel
+                objects_real_sizes.append({
+                    'class': obj_class,
+                    'real_width': obj_width,
+                    'real_height': obj_height,
+                    'position': obj_position,
+                })
+
+            walls_objects[wall_name] = {
+                'orientation': orientation,
+                'objects': objects_real_sizes
+            }
+            logger.info(f"Collected {len(objects_real_sizes)} objects for {wall_name} Wall.")
+
+        # Draw the room with objects
+        layout_image_base64 = draw_room(room_width, room_height, walls_objects)
+        logger.info("Room layout drawn successfully.")
+
+        return jsonify({'layout_image': layout_image_base64})
+
+    except Exception as e:
+        logger.error(f"Error in process_image: {e}")
+        return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
     app.run(debug=True)
