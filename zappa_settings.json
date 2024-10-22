@@ -1,0 +1,12 @@
+{
+  "main": {
+    "app_function": "app.app",
+    "aws_region": "ap-southeast-1",
+    "project_name": "aidesigner-lambda-app",
+    "runtime": "python3.11",
+    "s3_bucket": "zappa-aidesigner-deployments",
+    "timeout_seconds": 30,
+    "memory_size": 128,
+    "keep_warm": false
+  }
+}
